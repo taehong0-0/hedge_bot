@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import os
 import json
 import certifi
@@ -29,11 +30,11 @@ logger.addHandler(ch)
 # ==========================================
 TARGET_EXCHANGE = "backpack"  # 대상 거래소: backpack, pacifica, extended
 COIN = "BTC"                  # 거래 대상 코인
-AMOUNT = 0.002                # 거래 수량 (BTC 단위)
+AMOUNT = 0.005                # 거래 수량 (BTC 단위)
 BUY_OFFSET = -0.5             # 매수 시 마크 프라이스 대비 가격
 SELL_OFFSET = 0.5             # 매도 시 마크 프라이스 대비 가격
 
-HEDGE_WAIT_TIME = 5         # 사이클 중간 대기 시간 (초)
+HEDGE_WAIT_TIME = 120         # 사이클 중간 대기 시간 (초) - 신규 요구사항: 2분
 COOLDOWN_TIME = 5           # 사이클 종료 후 대기 시간 (초)
 
 # 헤징 설정
@@ -203,37 +204,50 @@ class VolumeBot:
                 await asyncio.sleep(1)
 
         # 2. 유지 단계 (Phase 2)
-        logger.info(f"[유지] {HEDGE_WAIT_TIME}초 대기...")
-        await asyncio.sleep(HEDGE_WAIT_TIME)
-        await self.sync_hedge()
-
-        # 3. 매도 단계 (Phase 3)
-        logger.info(f"[매도] 시작 -> 목표: {base_pos}")
-        while True:
+        logger.info(f"[유지] {HEDGE_WAIT_TIME}초 동안 실시간 감시 시작...")
+        start_wait_time = time.time()
+        while time.time() - start_wait_time < HEDGE_WAIT_TIME:
             curr_signed = await self.sync_hedge()
             
-            if curr_signed <= base_pos + Decimal("0.0000001"):
-                logger.info("[매도] 기준점 복귀 완료")
+            # 만약 포지션이 청산되거나 수동으로 닫혀서 베이스 라인으로 돌아왔다면 대기 중단
+            if abs(curr_signed - base_pos) < Decimal("0.0000001"):
+                logger.warning("[상태] 포지션이 이미 정리되었습니다. (청산 혹은 수동 종료)")
                 break
                 
-            await self.target_ex.cancel_orders(self.symbol)
-            price = await self.get_target_price()
-            if not price:
-                await asyncio.sleep(2)
-                continue
+            await asyncio.sleep(1) # 1초마다 감시
+
+        # 3. 매도 단계 (Phase 3)
+        # 이미 포지션이 정리된 상태라면 매도 단계를 건너뜀
+        curr_signed = await self.sync_hedge()
+        if abs(curr_signed - base_pos) < Decimal("0.0000001"):
+            logger.info("[완료] 포지션이 비어있으므로 매도 단계를 생략하고 사이클을 마칩니다.")
+        else:
+            logger.info(f"[매도] 시작 -> 목표: {base_pos}")
+            while True:
+                curr_signed = await self.sync_hedge()
                 
-            sell_price = price + SELL_OFFSET
-            excess = float(curr_signed - base_pos)
-            
-            logger.info(f"[{self.target_name}] 매도 주문 (Post-Only): {sell_price}, 남은수량: {excess}")
-            try:
-                await self.target_ex.create_order(
-                    self.symbol, "sell", excess, sell_price, "limit", post_only=POST_ONLY
-                )
-                await asyncio.sleep(CHECK_INTERVAL)
-            except Exception as e:
-                logger.error(f"주문 에러: {e}")
-                await asyncio.sleep(1)
+                if curr_signed <= base_pos + Decimal("0.0000001"):
+                    logger.info("[매도] 기준점 복귀 완료")
+                    break
+                    
+                await self.target_ex.cancel_orders(self.symbol)
+                price = await self.get_target_price()
+                if not price:
+                    await asyncio.sleep(2)
+                    continue
+                    
+                sell_price = price + SELL_OFFSET
+                excess = float(curr_signed - base_pos)
+                
+                logger.info(f"[{self.target_name}] 매도 주문 (Post-Only): {sell_price}, 남은수량: {excess}")
+                try:
+                    await self.target_ex.create_order(
+                        self.symbol, "sell", excess, sell_price, "limit", post_only=POST_ONLY
+                    )
+                    await asyncio.sleep(CHECK_INTERVAL)
+                except Exception as e:
+                    logger.error(f"주문 에러: {e}")
+                    await asyncio.sleep(1)
 
         await self.sync_hedge()
         logger.info(f"사이클 종료. {COOLDOWN_TIME}초 대기...")
